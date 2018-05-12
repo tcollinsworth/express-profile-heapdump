@@ -1,7 +1,8 @@
 const express = require('express')
+const compression = require('compression')
 
 const heapdump = require('heapdump')
-const profile = require('v8-profiler')
+const profiler = require('v8-profiler')
 
 const fs = require('fs')
 const os = require('os')
@@ -14,7 +15,7 @@ const BASIC_AUTH_PASSWORD = process.env.PROFILING_HEAPDUMP_BASIC_AUTH_PASSWORD |
 const HOST = process.env.PROFILING_HEAPDUMP_HOST || 'localhost'
 const PORT = process.env.PROFILING_HEAPDUMP_PORT || '6660'
 
-const PROFILING_DURATION_MS_DEFAULT = parseInt(process.env.PROFILING_DURATION_MS_DEFAULT || '300000', 10) // 5 min
+const PROFILING_DURATION_SEC_DEFAULT = parseInt(process.env.PROFILING_DURATION_SEC_DEFAULT || '300', 10) // 5 min
 
 //http://man7.org/linux/man-pages/man7/signal.7.html
 const PROFILING_SIGNAL = process.env.PROFILING_SIGNAL || 'SIGUSR1' // SIGUSR1 = 30,10,16
@@ -26,17 +27,27 @@ const router = express.Router()
 exports.default = router
 
 let serviceStarted = false
-let profilingDurationMs = PROFILING_DURATION_MS_DEFAULT
+let profilingDurationSec = PROFILING_DURATION_SEC_DEFAULT
+
+let profileSampleRateUs = 1000 //default
 
 let profilingInProgress = false
 let heapdumpInProgress = false
+
+let heapdumpFilename
+let profileStartTs
+let profileFilename
 
 //using only GET so it works via browser URL and one less argument via curl
 router.get('/heapdump', doHeapdump)
 
 router.get('/profile/rate/:rate', setSamplingRate)
 router.get('/profile/start', startProfilingReq)
-router.get('/profile/stop', stopProfiling)
+router.get('/profile/stop', stopProfilingReq)
+
+//rest list *.heapsnapshot, *.cpuprofile
+//rest delete xxx.heapsnapshot or xxx.cpuprofile
+//curl download with compression *.heapsnapshot, *.cpuprofile
 
 router.get('/list', listFiles) //TODO only specific files, no paths
 router.get('/targz', targzFiles) //TODO all, or specified, only specific files, no paths
@@ -92,81 +103,226 @@ function initBasicAuth(app, router) {
   app.use('/debug', passport.authenticate('basic', { session: false }), router)
 }
 
-//rest list *.heapsnapshot, *.cpuprofile
-//rest delete xxx.heapsnapshot or xxx.cpuprofile
-//curl download with compression *.heapsnapshot, *.cpuprofile
-
-//REST
-//always returns server hostname and port
-//if server name and/or port are passed as query params, will only succeed if hostname and/or port matches - aides in retrying till LB routes to correct node.js instance
-
-// set sampling rate
-// /profile/start
-// /profile/stop
-// /heapdump
-
-// SIGUSR1
-// SIGUSR2
-
 function doHeapdump(req, resp) {
+  if (wrongHost(req, resp)) {
+    return
+  }
+
   if (heapdumpInProgress) {
-    process.stdout.write(`Ignoring, heapdump currently in-progress on ${os.hostname()}:${PORT}\n`)
+    resp.status(500).json({
+      completed: false,
+      error: 'Ignoring, heapdump in-progress',
+      node: `${os.hostname}:${PORT}`,
+    })
     return
   }
   heapdumpInProgress = true
-  //TODO
-  const response = {
-    node: `${os.hostname}:${PORT}`,
-    heapdump: '' //TODO filename
-  }
+
+  startHeapDump(err => {
+    if (err) {
+      resp.status(500).json({
+        completed: false,
+        error: err.message,
+        node: `${os.hostname}:${PORT}`,
+      })
+      heapdumpInProgress = false
+    } else {
+      resp.json({
+        completed: true,
+        filename: heapdumpFilename,
+        node: `${os.hostname}:${PORT}`,
+      })
+      heapdumpInProgress = false
+    }
+  })
+}
+
+// v8-profiler lib seg faulted and crashed on node v9.x, using heapdump lib
+function startHeapDump(cb) {
+  const ts = new Date().toISOString()
+  //extension must be .heapsnapshot for chrome node.js developer tools
+  heapdumpFilename = `heapdump-${os.hostname()}-${ts}.heapsnapshot`
+
+  heapdump.writeSnapshot(heapdumpFilename, err => {
+    process.stdout.write(`Completed heapdump to file ${heapdumpFilename} on ${os.hostname()}:${PORT}\n`)
+    cb(err, heapdumpFilename)
+  })
 }
 
 function setSamplingRate(req, resp) {
-  if (profilingInProgress) {
-    process.stdout.write(`Ignoring, profiling currently in-progress for ${profilingDurationMs} ms on ${os.hostname()}:${PORT}\n`)
+  if (wrongHost(req, resp)) {
     return
   }
-  //TODO
-  const response = {
-    node: `${os.hostname}:${PORT}`,
+
+  if (profilingInProgress) {
+    resp.status(409).json({
+      error: 'Ignoring, profiling in-progress',
+      node: `${os.hostname}:${PORT}`,
+    })
+    return
   }
+
+  const newProfileSampleRateUs = req.params.rate || 1000
+  profileSampleRateUs = newProfileSampleRateUs
+
+  resp.json({
+    newProfileSampleRateUs,
+    node: `${os.hostname}:${PORT}`,
+  })
 }
 
 function startProfilingReq(req, resp) {
+  if (wrongHost(req, resp)) {
+    return
+  }
 
-  const response = {
-    node: `${os.hostname}:${PORT}`,
-    profile: '' //TODO filename
+  if (profilingInProgress) {
+    resp.status(409).json({
+      started: false,
+      error: 'Ignoring, profiling in-progress',
+      node: `${os.hostname}:${PORT}`,
+    })
+    return
+  }
+
+  let stopAfterSec = profilingDurationSec
+  if (req.query.stopAfterSec != null) {
+    try {
+      stopAfterSec = parseInt(req.query.stopAfterSec || profilingDurationSec, 10)
+      if (stopAfterSec < 1 || stopAfterSec > 3600) {
+        throw new Error('stopAfterSec must be between 0 and 3601')
+      }
+    } catch (err) {
+      resp.status(400).json({
+        started: false,
+        error: err.message,
+        node: `${os.hostname}:${PORT}`,
+      })
+      return
+    }
+  }
+
+  let sampleRateUs = profileSampleRateUs
+  if (req.query.sampleRateUs != null) {
+    try {
+      sampleRateUs = parseInt(req.query.sampleRateUs || profileSampleRateUs, 10)
+      if (sampleRateUs < 1) {
+        throw new Error('sampleRateUs must be > 0')
+      }
+    } catch (err) {
+      resp.status(400).json({
+        started: false,
+        error: err.message,
+        node: `${os.hostname}:${PORT}`,
+      })
+      return
+    }
+  }
+
+  const profileName = startProfiling(sampleRateUs)
+
+  if (profileName == null) {
+    resp.status(409).json({
+      started: false,
+      error: 'Ignoring, profiling in-progress',
+      node: `${os.hostname}:${PORT}`,
+    })
+  } else {
+    setTimeout(stopProfiling, (stopAfterSec * 1000))
+    resp.status(202).json({
+      started: true,
+      sampleRateUs,
+      filename: profileName,
+      node: `${os.hostname}:${PORT}`,
+      completes: new Date(Date.now() + (stopAfterSec * 1000)).toISOString(),
+    })
   }
 }
 
-function startProfiling() {
+function startProfiling(sampleRateUs) {
   if (profilingInProgress) {
-    process.stdout.write(`Ignoring, profiling currently in-progress for ${profilingDurationMs} ms on ${os.hostname()}:${PORT}\n`)
-    return
+    process.stdout.write(`Ignoring, profiling in-progress on ${os.hostname()}:${PORT}\n`)
+    return undefined
   }
   profilingInProgress = true
-  //TODO
+
+  profiler.setSamplingInterval(sampleRateUs)
+  profileStartTs = new Date().toISOString()
+  profileFilename = `profile-${os.hostname()}-${profileStartTs}.cpuprofile`
+  profiler.startProfiling(profileFilename, true)
+  process.stdout.write(`Started profiling at ${sampleRateUs} us to file ${profileFilename} on ${os.hostname()}:${PORT}\n`)
+  return profileFilename
 }
 
 function stopProfilingReq(req, resp) {
-  //TODO
-  const response = {
-    node: `${os.hostname}:${PORT}`,
-    profile: '' //TODO filename
-  }
-}
-
-function stopProfiling() {
-  if (!profilingInProgress) {
-    process.stdout.write(`Ignoring, profiling NOT currently in-progress for ${profilingDurationMs} ms on ${os.hostname()}:${PORT}\n`)
+  if (wrongHost(req, resp)) {
     return
   }
-  //TODO
+
+  if (!profilingInProgress) {
+    resp.status(412).json({
+      stopped: false,
+      error: 'Ignoring, profiling NOT in-progress',
+      node: `${os.hostname}:${PORT}`,
+    })
+    return
+  }
+
+  stopProfiling(err => {
+    if (err) {
+      resp.status(500).json({
+        stopped: false,
+        error: err.message,
+        node: `${os.hostname}:${PORT}`,
+      })
+    } else {
+      resp.json({
+        stopped: true,
+        filename: profileFilename,
+        node: `${os.hostname}:${PORT}`,
+      })
+      process.stdout.write(`Successfully stopped profiling to file ${profileFilename} on ${os.hostname()}:${PORT}\n`)
+    }
+  })
 }
 
+function stopProfiling(completedCB) {
+  if (!profilingInProgress) {
+    process.stdout.write(`Ignoring, profiling NOT in-progress on ${os.hostname()}:${PORT}\n`)
+    return
+  }
+
+  const profile = profiler.stopProfiling()
+  profile
+    .export()
+    .pipe(fs.createWriteStream(profileFilename))
+    .on('finish', () => {
+      profile.delete()
+      profilingInProgress = false
+      if (completedCB) {
+        completedCB()
+      } else {
+        process.stdout.write(`Profiling completed to file ${profileFilename} on ${os.hostname()}:${PORT}\n`)
+      }
+    })
+    .on('error', err => {
+      profilingInProgress = false
+      if (completedCB) {
+        completedCB(err)
+      } else {
+        process.stdout.write(`Error occurred on ${os.hostname()}:${PORT}, profiling: ${err}\n`)
+      }
+    })
+}
+
+//rest list *.heapsnapshot, *.cpuprofile
 function listFiles(req, resp) {
+  if (wrongHost(req, resp)) {
+    return
+  }
+
   //TODO list all profile and heapdump files
+
   const list = {
     node: `${os.hostname}:${PORT}`,
     profiles: [],
@@ -175,6 +331,10 @@ function listFiles(req, resp) {
 }
 
 function deleteFiles(req, resp) {
+  if (wrongHost(req, resp)) {
+    return
+  }
+
   const response = {
     node: `${os.hostname}:${PORT}`,
     profile: '' //TODO filename
@@ -182,28 +342,47 @@ function deleteFiles(req, resp) {
 }
 
 function targzFiles(req, resp) {
+  if (wrongHost(req, resp)) {
+    return
+  }
 
+  //TODO
 }
 
 function downloadFile(req, resp) {
-
-}
-
-process.on(PROFILING_SIGNAL, () => {
-  if (profilingInProgress) {
-    process.stdout.write(`Ignoring, profiling currently in-progress for ${profilingDurationMs} ms on ${os.hostname()}:${PORT}\n`)
+  if (wrongHost(req, resp)) {
     return
   }
-  profilingInProgress = true
-  process.stdout.write(`Start profiling for ${profilingDurationMs} ms on ${os.hostname()}:${PORT}\n`)
-  startProfiling()
-  setTimeout(stopProfiling, profilingDurationMs)
-  process.stdout.write(`Stop profiling on ${os.hostname()}:${PORT}\n`)
+
+  //TODO
+}
+
+//if server name and/or port are passed as query params, will only succeed if hostname and/or port matches - aides in retrying till LB routes to correct node.js instance
+function wrongHost(req, resp) {
+  console.log(req.query.host)
+  if (req.query.host != null && req.query.host != os.hostname && req.query.host != `${os.hostname()}:${PORT}`) {
+    resp.status(412).json({
+      error: `Ignoring, incorrect host: ${os.hostname()}:${PORT}, try again`,
+      expected: req.query.host
+    })
+    return true
+  }
+  return false
+}
+
+//default is SIGUSR1
+process.on(PROFILING_SIGNAL, () => {
+  if (profilingInProgress) {
+    process.stdout.write(`Ignoring, profiling in-progress on ${os.hostname()}:${PORT}\n`)
+    return
+  }
+  startProfiling(profileSampleRateUs)
+  setTimeout(stopProfiling, (profilingDurationSec * 1000))
 })
 
 // already listens in heapdump as SIGUSR2
 process.on(HEAPDUMP_SIGNAL, () => {
-  process.stdout.write(`Starting heapdump on ${os.hostname()}:${PORT}\n`)
+  process.stdout.write(`Started heapdump on ${os.hostname()}:${PORT}\n`)
 })
 
 module.exports = {

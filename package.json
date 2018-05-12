@@ -20,6 +20,7 @@
     "node": ">=0.10"
   },
   "dependencies": {
+    "compression": "^1.7.2",
     "express": "^4.16.3",
     "heapdump": "^0.3.9",
     "passport": "^0.4.0",
