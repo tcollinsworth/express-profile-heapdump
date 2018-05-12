@@ -1,0 +1,29 @@
+{
+  "name": "express-profile-heapdump",
+  "version": "1.0.0",
+  "description": "Adds ability to acquire/download profiling and heap dumps via kill signals and authenticated REST endpoints - i.e., in production where connecting with chrome is verboten",
+  "main": "express-profile-heapdump",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": {
+    "name": "Troy Collinsworth",
+    "email": "troycollinsworth@gmail.com"
+  },
+  "license": "ISC",
+  "keywords": [
+    "profile",
+    "profiler",
+    "inspector"
+  ],
+  "engines": {
+    "node": ">=0.10"
+  },
+  "dependencies": {
+    "express": "^4.16.3",
+    "heapdump": "^0.3.9",
+    "passport": "^0.4.0",
+    "passport-http": "^0.3.0",
+    "v8-profiler": "^5.7.0"
+  }
+}

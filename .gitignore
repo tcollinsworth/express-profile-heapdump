@@ -1,0 +1,11 @@
+logs
+*.log
+npm-debug.log*
+test-results
+node_modules
+*~
+.nyc_output
+coverage
+dist
+*.cpuprofile
+*.heapsnapshot
