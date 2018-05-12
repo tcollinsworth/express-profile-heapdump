@@ -1,7 +1,7 @@
 const express = require('express')
 
 const heapdump = require('heapdump')
-const profile = require('@risingstack/v8-profiler')
+const profile = require('v8-profiler')
 
 const fs = require('fs')
 const os = require('os')
