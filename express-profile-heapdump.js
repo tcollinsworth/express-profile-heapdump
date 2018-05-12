@@ -104,7 +104,7 @@ function initBasicAuth(app, router) {
 }
 
 function doHeapdump(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -150,7 +150,7 @@ function startHeapDump(cb) {
 }
 
 function setSamplingRate(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -172,7 +172,7 @@ function setSamplingRate(req, resp) {
 }
 
 function startProfilingReq(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -255,7 +255,7 @@ function startProfiling(sampleRateUs) {
 }
 
 function stopProfilingReq(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -317,7 +317,7 @@ function stopProfiling(completedCB) {
 
 //rest list *.heapsnapshot, *.cpuprofile
 function listFiles(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -331,7 +331,7 @@ function listFiles(req, resp) {
 }
 
 function deleteFiles(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -342,7 +342,7 @@ function deleteFiles(req, resp) {
 }
 
 function targzFiles(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -350,7 +350,7 @@ function targzFiles(req, resp) {
 }
 
 function downloadFile(req, resp) {
-  if (wrongHost(req, resp)) {
+  if (incorrectHost(req, resp)) {
     return
   }
 
@@ -358,7 +358,7 @@ function downloadFile(req, resp) {
 }
 
 //if server name and/or port are passed as query params, will only succeed if hostname and/or port matches - aides in retrying till LB routes to correct node.js instance
-function wrongHost(req, resp) {
+function incorrectHost(req, resp) {
   console.log(req.query.host)
   if (req.query.host != null && req.query.host != os.hostname && req.query.host != `${os.hostname()}:${PORT}`) {
     resp.status(412).json({
