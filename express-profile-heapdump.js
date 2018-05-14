@@ -21,6 +21,8 @@ const PROFILING_DURATION_SEC_DEFAULT = parseInt(process.env.PROFILING_DURATION_S
 const PROFILING_SIGNAL = process.env.PROFILING_SIGNAL || 'SIGUSR1' // SIGUSR1 = 30,10,16
 const HEAPDUMP_SIGNAL = process.env.HEAPDUMP_SIGNAL || 'SIGUSR2' // SIGUSR2 = 31,12,17
 
+process.env.NODE_HEAPDUMP_OPTIONS='nosignal' // disable default heapdump SIGUSR2 so we can override it and control filename
+
 const router = express.Router()
 //export router for adding to existing express service
 //client is responsible for protecting, authenticating/authorizing access
@@ -51,8 +53,8 @@ router.get('/profile/stop', stopProfilingReq)
 
 router.get('/list', listFiles) //TODO only specific files, no paths
 router.get('/targz', targzFiles) //TODO all, or specified, only specific files, no paths
-router.get('/download/:filename', downloadFile) //TODO only specific files, no paths
-router.get('/delete', deleteFiles) //TODO only specific files, no paths
+router.get('/download/:filename', downloadFile) //TODO only specific file, no paths
+router.get('/delete', deleteFiles) //TODO all or only specific files, no paths
 
 // Initializes stand-alone express service and initializes the default basic auth or calls a passed in custom authentication function
 function startService(initAuth) {
@@ -83,13 +85,15 @@ function startService(initAuth) {
   serviceStarted = true
 }
 
-// Default basic auth initialization, can be replace
+//TODO express-rate-limit
+
+// Default basic auth initialization, can be overriden
 function initBasicAuth(app, router) {
   const passport = require('passport')
   const BasicStrategy = require('passport-http').BasicStrategy
 
-  if (BASIC_AUTH_USER === 'change' && BASIC_AUTH_PASSWORD === 'me') {
-    process.stdout.write(`WARNING: change the following express-profile-heapdump environment vars in production on ${os.hostname()}:${PORT}: PROFILING_HEAPDUMP_BASIC_AUTH_USER, PROFILING_HEAPDUMP_BASIC_AUTH_PASSWORD\n`)
+  if (BASIC_AUTH_USER === 'change' || BASIC_AUTH_PASSWORD === 'me') {
+    process.stdout.write(`WARNING: change the following environment vars in production on ${os.hostname()}:${PORT}: PROFILING_HEAPDUMP_BASIC_AUTH_USER, PROFILING_HEAPDUMP_BASIC_AUTH_PASSWORD\n`)
   }
 
   passport.use(new BasicStrategy((user, password, done) => {
@@ -101,6 +105,10 @@ function initBasicAuth(app, router) {
 
   app.use(passport.initialize())
   app.use('/debug', passport.authenticate('basic', { session: false }), router)
+}
+
+function initNoAuth(app, router) {
+  app.use('/debug', router)
 }
 
 function doHeapdump(req, resp) {
@@ -142,10 +150,17 @@ function startHeapDump(cb) {
   const ts = new Date().toISOString()
   //extension must be .heapsnapshot for chrome node.js developer tools
   heapdumpFilename = `heapdump-${os.hostname()}-${ts}.heapsnapshot`
+  process.stdout.write(`Starting heapdump to file ${heapdumpFilename} on ${os.hostname()}:${PORT}, ${err.message}\n`)
 
   heapdump.writeSnapshot(heapdumpFilename, err => {
-    process.stdout.write(`Completed heapdump to file ${heapdumpFilename} on ${os.hostname()}:${PORT}\n`)
-    cb(err, heapdumpFilename)
+    if (err) {
+      process.stdout.write(`Heapdump error on ${os.hostname()}:${PORT}, ${err.message}\n`)
+    } else {
+      process.stdout.write(`Completed heapdump to file ${heapdumpFilename} on ${os.hostname()}:${PORT}\n`)
+    }
+    if (cb) {
+      cb(err, heapdumpFilename)
+    }
   })
 }
 
@@ -357,9 +372,9 @@ function downloadFile(req, resp) {
   //TODO
 }
 
+//TODO move to middleware
 //if server name and/or port are passed as query params, will only succeed if hostname and/or port matches - aides in retrying till LB routes to correct node.js instance
 function incorrectHost(req, resp) {
-  console.log(req.query.host)
   if (req.query.host != null && req.query.host != os.hostname && req.query.host != `${os.hostname()}:${PORT}`) {
     resp.status(412).json({
       error: `Ignoring, incorrect host: ${os.hostname()}:${PORT}, try again`,
@@ -370,7 +385,7 @@ function incorrectHost(req, resp) {
   return false
 }
 
-//default is SIGUSR1
+//default is SIGUSR1 or USR1
 process.on(PROFILING_SIGNAL, () => {
   if (profilingInProgress) {
     process.stdout.write(`Ignoring, profiling in-progress on ${os.hostname()}:${PORT}\n`)
@@ -380,9 +395,16 @@ process.on(PROFILING_SIGNAL, () => {
   setTimeout(stopProfiling, (profilingDurationSec * 1000))
 })
 
-// already listens in heapdump as SIGUSR2
+// listens in heapdump lib for SIGUSR2 o USR2, this just logs it
 process.on(HEAPDUMP_SIGNAL, () => {
-  process.stdout.write(`Started heapdump on ${os.hostname()}:${PORT}\n`)
+  if (heapdumpInProgress) {
+    process.stdout.write(`Ignoring, heapdump in-progress on ${os.hostname()}:${PORT}\n`)
+    return
+  }
+  heapdumpInProgress = true
+  startHeapDump(err => {
+    heapdumpInProgress = false
+  })
 })
 
 module.exports = {
